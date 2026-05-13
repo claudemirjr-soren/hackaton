@@ -6,24 +6,40 @@ const path = require('path');
 const PROTO_PATH = path.join(__dirname, './protos/translation.proto');
 const VIDEO_PATH = path.join(__dirname, './test-video.mp4');
 
-const packageDefinition = protoLoader.loadSync(PROTO_PATH, { keepCase: true, longs: String, defaults: true });
+const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
+  keepCase: true,
+  longs: String,
+  defaults: true,
+});
 const translationProto = grpc.loadPackageDefinition(packageDefinition).translation.v1;
 
-const client = new translationProto.TranslationProvider(
-  'localhost:50052',
-  grpc.credentials.createInsecure()
-);
-
-const CHANNEL_COUNT = 3;
+const CHANNEL_COUNT = 3290;
 const CLIENTS_PER_CHANNEL = 5;
 const CHUNK_SIZE = 64 * 1024;
 const EXPECTED_LEGENDS_PER_CLIENT = Math.ceil(fs.statSync(VIDEO_PATH).size / CHUNK_SIZE);
 const TEST_TIMEOUT_MS = 30_000;
+const CLIENT_POOL_SIZE = Math.max(1, Math.ceil((CHANNEL_COUNT * CLIENTS_PER_CHANNEL) / 100));
+
+const clientPool = [];
+for (let i = 0; i < CLIENT_POOL_SIZE; i += 1) {
+  clientPool.push(
+    new translationProto.TranslationProvider('localhost:50052', grpc.credentials.createInsecure(), {
+      'grpc.primary_user_agent': `client-tester-${i}`,
+    }),
+  );
+}
+
+let nextClientIdx = 0;
+const pickClient = () => {
+  const c = clientPool[nextClientIdx % clientPool.length];
+  nextClientIdx += 1;
+  return c;
+};
 
 function runChannelClient(channelId, clientNumber, sendsVideo) {
   return new Promise((resolve) => {
     const clientId = `${channelId}/client-${clientNumber}${sendsVideo ? '/sender' : '/listener'}`;
-    const call = client.StreamTranslation();
+    const call = pickClient().StreamTranslation();
     let receivedResults = 0;
     let mismatchedResults = 0;
     let settled = false;
@@ -33,25 +49,33 @@ function runChannelClient(channelId, clientNumber, sendsVideo) {
       settled = true;
 
       if (receivedResults === 0) {
-        console.warn(`[${clientId}] ⚠️ Stream finalizada sem nenhuma legenda retornada pelo servidor.`);
+        console.warn(
+          `[${clientId}] ⚠️ Stream finalizada sem nenhuma legenda retornada pelo servidor.`,
+        );
       }
 
       if (mismatchedResults > 0) {
-        console.error(`[${clientId}] ❌ Stream recebeu ${mismatchedResults} legenda(s) de outro canal.`);
+        console.error(
+          `[${clientId}] ❌ Stream recebeu ${mismatchedResults} legenda(s) de outro canal.`,
+        );
       }
 
       console.log(`[${clientId}] 🏁 ${reason}. Legendas recebidas: ${receivedResults}.`);
       resolve({ channelId, clientId, receivedResults, mismatchedResults });
     };
 
-    console.log(`[${clientId}] 🎬 Entrando no canal${sendsVideo ? ' e enviando vídeo' : ' como listener'}`);
+    console.log(
+      `[${clientId}] 🎬 Entrando no canal${sendsVideo ? ' e enviando vídeo' : ' como listener'}`,
+    );
 
     call.on('data', (response) => {
       const responseChannelId = response.channel_id || response.channelId || '';
 
       if (responseChannelId !== channelId) {
         mismatchedResults += 1;
-        console.error(`[${clientId}] ❌ Legenda recebida no canal errado: ${responseChannelId || '<vazio>'}`);
+        console.error(
+          `[${clientId}] ❌ Legenda recebida no canal errado: ${responseChannelId || '<vazio>'}`,
+        );
         call.cancel();
         finish('mismatch de canal');
         return;
@@ -76,7 +100,7 @@ function runChannelClient(channelId, clientNumber, sendsVideo) {
 
     call.write({
       data: Buffer.alloc(0),
-      channel_id: channelId
+      channel_id: channelId,
     });
 
     if (!sendsVideo) {
@@ -88,7 +112,7 @@ function runChannelClient(channelId, clientNumber, sendsVideo) {
     readStream.on('data', (chunk) => {
       const canContinue = call.write({
         data: chunk,
-        channel_id: channelId
+        channel_id: channelId,
       });
 
       if (!canContinue) {
@@ -129,14 +153,16 @@ Promise.race([Promise.all(channelClients), timeout])
   .then((results) => {
     if (results.timeout) {
       console.error(`❌ Timeout de ${TEST_TIMEOUT_MS}ms aguardando canais compartilhados.`);
-      client.close();
+      clientPool.forEach((c) => c.close());
       process.exitCode = 1;
       return;
     }
 
     const totalLegends = results.reduce((sum, result) => sum + result.receivedResults, 0);
     const totalMismatches = results.reduce((sum, result) => sum + result.mismatchedResults, 0);
-    const missingLegends = results.filter((result) => result.receivedResults !== EXPECTED_LEGENDS_PER_CLIENT);
+    const missingLegends = results.filter(
+      (result) => result.receivedResults !== EXPECTED_LEGENDS_PER_CLIENT,
+    );
 
     if (totalMismatches > 0) {
       console.error(`❌ ${totalMismatches} legenda(s) recebida(s) em canal incorreto.`);
@@ -144,17 +170,19 @@ Promise.race([Promise.all(channelClients), timeout])
     }
 
     if (missingLegends.length > 0) {
-      console.error(`❌ ${missingLegends.length} cliente(s) não receberam ${EXPECTED_LEGENDS_PER_CLIENT} legenda(s).`);
+      console.error(
+        `❌ ${missingLegends.length} cliente(s) não receberam ${EXPECTED_LEGENDS_PER_CLIENT} legenda(s).`,
+      );
       process.exitCode = 1;
     }
 
     console.log(
-      `✅ ${results.length} conexões em ${CHANNEL_COUNT} canais finalizadas. Total de legendas recebidas: ${totalLegends}`
+      `✅ ${results.length} conexões em ${CHANNEL_COUNT} canais finalizadas. Total de legendas recebidas: ${totalLegends}`,
     );
-    client.close();
+    clientPool.forEach((c) => c.close());
   })
   .catch((err) => {
     console.error('❌ Erro inesperado:', err);
-    client.close();
+    clientPool.forEach((c) => c.close());
     process.exitCode = 1;
   });
