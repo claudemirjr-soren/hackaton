@@ -1,141 +1,266 @@
-# 🚀 Hackathon: Real-Time gRPC Channel Video Translation
+# Plano de Deploy do `api-gateway` na AWS
 
-Bem-vindo ao desafio de backend! Sua missão é construir uma **API Gateway de alta performance** que gerencie canais bidirecionais de vídeo e texto em tempo real, garantindo latência mínima, isolamento entre canais e gerenciamento eficiente de recursos.
+Este documento descreve como eu colocaria o `api-gateway` (Node.js / gRPC) em produção na AWS, com foco em (1) atender o contrato de **canal efêmero compartilhado por `channel_id`**, (2) suportar **gRPC bidirecional** (HTTP/2 end-to-end) e (3) escalar horizontalmente sem perder a semântica dos canais em memória.
 
-## 🏗️ A Arquitetura
+---
 
-O sistema é composto por três partes, mas você é responsável pelo coração da operação:
+## 1. Visão geral da arquitetura proposta
 
-- **Client (Mock):** entra em canais, envia chunks de vídeo e/ou escuta legendas em tempo real.
-- **API Gateway (Seu Desafio):** atua como um proxy inteligente que cria, compartilha e destrói "canais" efêmeros via gRPC.
-- **Translation Service (Provedor):** serviço robusto em Swift (Vapor) que processa o vídeo e devolve a tradução.
+```
+                   Internet
+                      │ (gRPC / HTTP/2 + TLS)
+                      ▼
+               ┌─────────────┐
+               │     ALB     │  (HTTP/2 listener, target-type=ip)
+               │   gRPC LB   │
+               └──────┬──────┘
+                      │ ALGORITMO: consistent hashing por channel-id
+                      ▼ (via Envoy sidecar / dispatcher — ver §5)
+          ┌────────────────────────┐
+          │   api-gateway tasks    │  ECS Fargate Service
+          │     (N replicas)       │  Service Connect mesh
+          └────────────┬───────────┘
+                       │ gRPC interno (service-translation.local:50051)
+                       ▼
+          ┌────────────────────────┐
+          │ service-translation    │  ECS Fargate Service
+          │     (M replicas)       │
+          └────────────────────────┘
 
-## 🎯 A Missão
-
-Você deve implementar a lógica no `api-gateway` para:
-
-- **Entrada em Canal:** permitir que múltiplas conexões gRPC entrem no mesmo `channel_id`.
-- **Pipe de Dados:** receber chunks de vídeo de um cliente do canal e repassar imediatamente para o serviço Swift, sem bufferizar o vídeo completo.
-- **Broadcast:** toda legenda gerada para um `channel_id` deve ser enviada para todas as conexões ativas daquele mesmo canal.
-- **Isolamento:** legendas de um canal nunca podem ser entregues para clientes de outro canal.
-- **Efemeridade:** o canal é um recurso em memória mantido pelo Gateway enquanto houver clientes conectados. Quando o último cliente sair, o recurso deve ser liberado no Gateway e no Provedor.
-- **Resiliência:** lidar com desconexões abruptas sem deixar "zumbis" ou vazamentos de memória no Gateway ou no serviço de tradução.
-
-## 📡 Semântica do Canal
-
-O contrato continua sendo `protos/translation.proto`. A nomenclatura oficial do desafio permanece `channel_id`.
-
-Cada conexão gRPC pode atuar como:
-
-- **Sender:** cliente que entra no canal e envia chunks reais de vídeo.
-- **Listener:** cliente que entra no canal apenas para receber legendas.
-
-Como o contrato atual possui apenas `VideoFrame`, a entrada no canal é feita pelo primeiro frame enviado pelo cliente:
-
-```js
-{
-  data: Buffer.alloc(0),
-  channel_id: "canal-compartilhado-123"
-}
+Observabilidade: CloudWatch Logs + Container Insights + ADOT/X-Ray
+CI/CD: GitHub Actions → ECR → ECS rolling deploy
 ```
 
-Regras:
+---
 
-- Todo cliente deve enviar um primeiro frame com `channel_id` não vazio para entrar no canal.
-- `data` vazio significa apenas "entrar/registrar no canal".
-- `data` com bytes representa chunk real de vídeo.
-- Depois que uma conexão entrou em um `channel_id`, ela não pode trocar para outro `channel_id`.
-- Vários clientes podem usar o mesmo `channel_id` simultaneamente.
-- Se um cliente envia vídeo em um canal, todos os clientes conectados naquele mesmo canal recebem as legendas geradas.
-- Clientes conectados em outros canais não podem receber essas legendas.
-- O Gateway deve validar o `channel_id` também nas respostas vindas do Provedor antes de repassar para os clientes.
+## 2. Serviço de container
 
-## 🛠️ Requisitos Técnicos & Restrições
+**Escolha: Amazon ECS com Fargate.**
 
-- **Comunicação:** 100% gRPC (HTTP/2). Proibido o uso de REST ou bibliotecas HTTP 1.1.
-- **Contrato:** o arquivo `protos/translation.proto` é a única fonte da verdade.
-- **Recursos:** o serviço Swift está limitado a **256 MB de RAM**. Gerenciamento de buffer ineficiente causará Out of Memory (OOM).
-- **Linguagem:** o Gateway deve ser escrito em **Node.js (TypeScript)** ou **Go**.
-- **Estado:** o estado dos canais deve ser efêmero e em memória. Não crie banco de dados, fila externa ou endpoint REST para representar canais.
+Justificativa:
 
-## 📂 Estrutura do Projeto
+| Critério | ECS Fargate | EKS |
+|---|---|---|
+| Custo operacional | Sem gerenciar nodes | Precisa node group / Karpenter |
+| Curva de aprendizado | Baixa | Alta (RBAC, manifests, controllers) |
+| Integração nativa AWS | Service Connect, ALB, IAM Task Role, Secrets Manager direto | Tudo via add-ons / IRSA |
+| Adequação ao workload | App único, semi-stateful, gRPC | Ganha em ambientes multi-tenant |
+| Time-to-prod | Horas | Dias |
 
-```plaintext
-.
-├── protos/                 # Contrato gRPC (.proto)
-├── service-translation/    # [ORGANIZAÇÃO] Serviço Swift/Vapor (Não mexer)
-├── api-gateway/            # [VOCÊ] Esqueleto do seu desafio
-└── docker-compose.yaml     # Orquestração do ambiente
+O `api-gateway` é **um serviço focado**, sem necessidade de orquestração complexa, jobs ad-hoc, CRDs ou plataforma multi-team. **Fargate** entrega isolamento por task, integra com Service Connect e ALB gRPC sem fricção, e elimina a operação do plano de dados (nodes, AMIs, patches). EKS só valeria se já existisse uma plataforma K8s consolidada no time.
+
+Configuração de task:
+
+- **CPU/Memória:** começar com `0.5 vCPU / 1 GB` por task (Node single-thread + I/O bound). Ajustar via load test.
+- **Network mode:** `awsvpc` (cada task ganha ENI própria + security group dedicado).
+- **Task role IAM:** acesso mínimo (CloudWatch Logs, X-Ray, leitura no ECR).
+- **Health check:** gRPC health probe (`grpc_health_probe`) no container; ECS usa `containerHealthCheck` + ALB target group health.
+- **Graceful shutdown:** `stopTimeout: 30s` para drenar streams ativas ao final do deploy.
+
+---
+
+## 3. Registro de imagem e pipeline de build
+
+**Registry:** **Amazon ECR (private repository)** `hackaton/api-gateway`.
+
+Por quê: ECR integra com IAM (sem segredos no `docker login`), tem scan nativo (Inspector ou básico), lifecycle policy para descartar imagens antigas, e é a opção mais barata/rápida para puxar de dentro da VPC (via VPC endpoint).
+
+**Pipeline (GitHub Actions):**
+
+```yaml
+on:
+  push:
+    branches: [main]
+    paths: ['api-gateway/**']
+
+jobs:
+  build-and-deploy:
+    permissions:
+      id-token: write   # OIDC para assumir role na AWS sem long-lived keys
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::<acct>:role/github-actions-ecr-push
+          aws-region: us-east-1
+      - uses: aws-actions/amazon-ecr-login@v2
+      - run: |
+          IMAGE=$ECR_REGISTRY/hackaton/api-gateway:$GITHUB_SHA
+          docker buildx build --platform linux/amd64 \
+            -f api-gateway/Dockerfile -t $IMAGE \
+            --push .
+      - run: |
+          aws ecs update-service \
+            --cluster prod \
+            --service api-gateway \
+            --force-new-deployment \
+            --task-definition $(aws ecs register-task-definition --cli-input-json file://taskdef.json --query taskDefinition.taskDefinitionArn --output text)
 ```
 
-## 🚀 Como Iniciar
+Pontos-chave:
 
-Suba o ambiente:
+- **OIDC** em vez de chaves AWS estáticas no GitHub.
+- **Lifecycle policy** no ECR mantendo as últimas 30 imagens da `main` + tags semânticas.
+- **Vulnerability scan on push** (Inspector v2). Falha o pipeline em CVE crítica.
+- **Image signing** com `cosign` (keyless via OIDC) para garantir proveniência.
 
-```bash
-docker compose up --build
+---
+
+## 4. Rede e descoberta de serviço
+
+**Service Connect** do ECS é a escolha primária.
+
+Como funciona:
+
+- Cada task ganha um proxy Envoy sidecar gerenciado pela AWS.
+- Endpoints são publicados num namespace do **Cloud Map** (`hackaton.internal`).
+- O `api-gateway` resolve `service-translation.hackaton.internal:50051` localmente; o Envoy faz o LB do lado cliente, com retries e timeouts configuráveis.
+- Suporte nativo a **gRPC/HTTP2**, ao contrário do antigo `awsvpc` puro com DNS round-robin.
+- Métricas HTTP/gRPC já emitidas pra CloudWatch.
+
+Topologia:
+
+- Uma **VPC privada** com subnets em ≥2 AZs.
+- **Security groups por serviço:**
+  - `sg-api-gateway` aceita `:50052` apenas do SG do ALB.
+  - `sg-service-translation` aceita `:50051` apenas do SG do `api-gateway`.
+- **VPC endpoints** (Interface Endpoints) pra ECR, CloudWatch Logs, Secrets Manager → tráfego nunca sai pra Internet.
+- **Sem NAT Gateway** se não houver outras dependências externas (economia).
+
+Alternativa considerada: Cloud Map puro com DNS A-records. Funciona, mas perde retries L7, observabilidade nativa e tem cache de DNS chato em runtime Node.
+
+---
+
+## 5. Exposição externa
+
+**Application Load Balancer (ALB) com listener HTTP/2** atrás de **AWS WAF** + **Route 53** (`grpc.dominio.com`).
+
+Por quê ALB (e não NLB):
+
+| | ALB | NLB |
+|---|---|---|
+| HTTP/2 / gRPC end-to-end | ✅ (desde 2020) | ✅ TCP transparente |
+| Header/path routing | ✅ | ❌ |
+| WAF integrado | ✅ | ❌ |
+| Health check gRPC | ✅ (status code) | TCP apenas |
+| Logs estruturados (access logs) | ✅ | Limitado |
+| Custo a alta vazão | $$ | $ |
+| Latência | ~ms a mais | Quase zero |
+
+Pra esse caso (tráfego gRPC com requisitos de WAF, logs detalhados e roteamento por path/host) o **ALB compensa** o pequeno overhead. NLB só seria preferível se a vazão fosse ordem de >100 Gbps ou se latência sub-ms fosse crítica.
+
+Configurações:
+
+- **Listener:** `HTTPS:443` com cert ACM. Protocol version `HTTP/2`.
+- **Target group:** `protocol=HTTP`, `protocol-version=gRPC`, target-type `ip`. Health check `/grpc.health.v1.Health/Check` com matcher `0,12`.
+- **Idle timeout:** 4000s (streams bidirecionais longas).
+- **Deregistration delay:** 30s pra drenar streams no rolling deploy.
+
+### Ponto crítico: roteamento por `channel_id` (afinidade de canal)
+
+O modelo do gateway mantém **canais em memória**: vários clientes com o mesmo `channel_id` precisam cair na **mesma task** pra compartilhar o stream upstream.
+
+ALB **não consegue** rotear por `channel_id` (o id vive no corpo protobuf de cada `VideoFrame`, não em header HTTP). Stickiness por cookie/IP **não resolve**, pois clientes do mesmo canal podem vir de IPs diferentes.
+
+**Solução adotada:** o cliente publica o `channel_id` também como **gRPC metadata** (`x-channel-id`), e na frente das tasks existe um **Envoy** (sidecar via Service Connect ou cluster próprio) com `RING_HASH` em cima daquele header:
+
+```yaml
+load_assignment: { ... ECS service discovery ... }
+lb_policy: RING_HASH
+lb_subset_config: { ... }
+route:
+  hash_policy:
+    - header: { header_name: "x-channel-id" }
 ```
 
-O que observar:
+Resultado: clientes com o mesmo `x-channel-id` caem deterministicamente na mesma task; tasks novas/removidas redistribuem só uma fração dos canais (consistent hashing).
 
-- O `service-translation` rodará em `localhost:50051`.
-- Seu `api-gateway` deve expor a porta `50052`.
-- Fique de olho nos logs: o serviço Swift avisará quando um canal for **Iniciado** ou **Destruído**.
+Alternativas analisadas:
 
-No estado inicial do repositório, o `api-gateway` expõe o contrato gRPC, mas o método `StreamTranslation` ainda retorna `UNIMPLEMENTED`. Isso é intencional: o desafio dos participantes é implementar os canais compartilhados e efêmeros dentro do gateway.
+- **Fanout via pub/sub (ElastiCache Redis ou MSK):** cada task assina o canal global, broadcast cruzado. Vantagem: roteamento trivial. Desvantagem: latência extra por hop, custo, complicação de ciclo de vida (TTL de canal entre réplicas).
+- **App Mesh com consistent hashing:** equivalente ao Envoy custom, mas em sunset (AWS depreciou App Mesh em 2024).
+- **Réplica única vertical:** simples, mas teto de capacidade definido por uma máquina só.
 
-## 🏆 Critérios de Aceite
+---
 
-- **Ciclo de Vida:** o log do Swift deve mostrar `Encerrando/Destruindo canal X` quando o canal for encerrado.
-- **Ciclo de Vida Compartilhado:** o canal deve continuar ativo enquanto houver pelo menos uma conexão naquele `channel_id`. O canal só deve ser encerrado quando o último cliente sair.
-- **Imutabilidade:** o `channel_id` enviado pelo cliente deve ser preservado e validado em todos os frames da mesma conexão.
-- **Broadcast:** todos os clientes conectados ao mesmo `channel_id` devem receber as legendas geradas para aquele canal.
-- **Isolamento:** nenhum cliente pode receber legenda de outro `channel_id`.
-- **Concorrência:** o gateway deve suportar múltiplos canais simultâneos, cada um com múltiplos clientes conectados.
+## 6. Escalabilidade
 
-## 💡 Dicas de Ouro
+Premissa: o gateway é **stateful por canal** (em memória), mas o estado é **particionável por `channel_id`**. Com consistent hashing (§5), cada task vira "dona" de um subconjunto de canais; adicionar/remover tasks rebalanceia só ~1/N canais.
 
-- O gRPC-Swift é muito sensível ao fechamento de streams. Certifique-se de que o seu Gateway está enviando o sinal de `end` corretamente.
-- Cuidado com o acúmulo de dados em memória. Faça o **pipe** dos dados, não o **buffer**.
-- O "canal" do desafio é um agrupamento efêmero de streams bidirecionais gRPC com o mesmo `channel_id`.
-- Não crie um banco, fila ou endpoint REST para representar esse recurso.
-- O `channel_id` vem do cliente e deve atravessar o gateway sem ser recriado.
-- Um listener deve conseguir entrar no canal enviando um frame inicial com `data` vazio.
-- Um cliente lento não deve causar acúmulo ilimitado de mensagens em memória.
+**Auto Scaling:**
 
-## 🧪 Teste de Aceite
+- **Target tracking** em ECS Application Auto Scaling, sinais combinados:
+  - `CPUUtilization` alvo 60%.
+  - **Métrica customizada** `ActiveChannels` emitida via EMF (ver §7); alvo, por exemplo, 200 canais por task.
+- **Cooldown alto pra scale-in** (10 min) — evita matar tasks com streams ativas.
+- **Min replicas: 2** (HA inter-AZ). **Max: 20** inicialmente.
 
-Fornecemos o script `client-tester.js` para validar a implementação do gateway. Antes da solução dos participantes, esse script deve falhar com `UNIMPLEMENTED`, terminar sem legendas ou detectar problemas de isolamento/broadcast. Depois da implementação correta, ele deve receber legendas em todos os clientes conectados aos canais e o serviço Swift deve encerrar cada canal ao fim do uso.
+**Deploys sem perder streams ativas:**
 
-Instalar dependências:
+1. **Rolling deploy** com `minimumHealthyPercent=100`, `maximumPercent=200`.
+2. ECS marca a task antiga como `DRAINING` → ALB para de mandar **conexões novas**.
+3. Connection draining de até 30s no target group + `stopTimeout: 30s` no container.
+4. O gateway intercepta `SIGTERM` e emite o gRPC trailer `GOAWAY` em cada stream → o cliente reconecta numa task nova; o Envoy faz o re-hash e a maioria dos canais reabre na mesma task ou cai num "vizinho" do ring.
 
-```Bash
-npm install @grpc/grpc-js @grpc/proto-loader
-```
+**Limites verticais:** com as otimizações atuais (1 stream upstream por canal, pipe sem buffer, backpressure), uma task `0.5 vCPU / 1 GB` atende centenas de canais. O bottleneck passa a ser CPU do Node (event loop) ou a memória do `service-translation`, não o gateway.
 
-Subir o Ambiente:
+---
 
-```Bash
-docker compose up --build
-```
+## 7. Observabilidade
 
-Executar o Script:
+Três pilares: **logs**, **métricas**, **tracing**.
 
-```Bash
-node client-tester.js
-```
+### Logs
 
-O teste atual cria:
+- **Driver:** `awslogs` direto pro CloudWatch Logs (`/ecs/api-gateway/<env>`).
+- **Formato:** JSON estruturado (pino/winston) com `traceId`, `channelId`, `clientId`, `event`, `latencyMs`.
+- **Retenção:** 30 dias em CloudWatch; export S3 + Athena pra análise histórica.
+- **Insights queries** prontas pra:
+  - "top 20 channels por duração",
+  - "taxa de erro por minuto",
+  - "tasks que mais teardown sofrem em 5 min" (sinal de scale-in agressivo).
 
-- 3 canais simultâneos.
-- 5 conexões por canal.
-- 1 sender por canal enviando vídeo real.
-- 4 listeners por canal apenas recebendo legendas.
+### Métricas
 
-O teste espera que:
+- **CloudWatch Container Insights** (CPU/mem/network por task — incluso no Fargate).
+- **Application metrics via EMF** (Embedded Metric Format) — log estruturado vira métrica sem precisar de daemon:
+  - `ActiveChannels` (gauge)
+  - `ChannelLifetimeMs` (histogram)
+  - `UpstreamWriteBackpressure` (count) — quantas vezes pausamos clientes
+  - `BroadcastWriteErrors` (count)
+  - `ClientsPerChannel` (histogram)
+- **Alarms** críticos:
+  - `5xx` > 1% por 5 min → page.
+  - `ActiveChannels / desiredCount` > 80% por 10 min → scale-out preventivo (caso o target tracking esteja em delay).
+  - `BroadcastWriteErrors` taxa anômala → degradação no Swift.
 
-- Todos os 5 clientes de cada canal recebam as legendas daquele canal.
-- Nenhum cliente receba legenda de outro canal.
-- Todos os canais sejam finalizados sem erro.
+### Tracing distribuído
 
-Observe os logs do `service-translation`: se o gerenciamento de canais estiver correto, você verá os chunks chegando para cada `channel_id` e cada canal sendo encerrado quando não houver mais clientes ativos.
+- **AWS Distro for OpenTelemetry (ADOT)** como sidecar.
+- Instrumentação automática do gRPC client/server em Node (`@opentelemetry/instrumentation-grpc`).
+- Exporter para **AWS X-Ray** (ou Tempo/AMG, dependendo do stack do time).
+- Atributos relevantes: `channel.id`, `upstream.service`, `frames.forwarded`, `client.role` (sender/listener).
+
+### Painéis e SLO
+
+- **Grafana** (AMG) consumindo CloudWatch + X-Ray.
+- SLOs iniciais:
+  - **Disponibilidade gRPC**: 99.9% (success rate de `StreamTranslation`).
+  - **Time-to-first-caption** (latência da 1ª legenda após o 1º frame de vídeo do sender) p99 < 2s.
+  - **Broadcast fanout latency** p99 < 200ms (delta entre `upstream.data` e `client.write` confirmado).
+
+---
+
+## Resumo das escolhas
+
+| Camada | Escolha | Motivo |
+|---|---|---|
+| Compute | **ECS Fargate** | Stateless infra, foco no app, integração nativa |
+| Registry | **ECR private** | IAM-first, scan, VPC endpoint |
+| CI/CD | **GitHub Actions + OIDC** | Sem long-lived secrets, deploy declarativo |
+| Service discovery | **ECS Service Connect** | Envoy gerenciado, gRPC-aware, métricas grátis |
+| LB externo | **ALB HTTP/2 + WAF** | gRPC nativo, roteamento L7, logs ricos |
+| Afinidade de canal | **Envoy consistent hashing** em `x-channel-id` metadata | Particionamento determinístico sem pub/sub |
+| Escalabilidade | Target tracking em **CPU + ActiveChannels** | Sinais combinados; scale-in conservador |
+| Observabilidade | **CloudWatch + EMF + ADOT/X-Ray** | Sem servidor de métricas próprio; tudo gerenciado |
